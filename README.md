@@ -244,26 +244,11 @@ The `Jenkinsfile` defines a **declarative pipeline** that Jenkins executes when 
 | Docker Build       | Builds and tags the Docker image                         |
 | Docker Verify      | Verifies the image and does a smoke-test import          |
 
-On **success**, the workspace is cleaned and a ✅ message is printed.  
-On **failure**, a ❌ message is printed with a pointer to the failing stage logs.
+
 
 ---
 
-## Version History
 
-| Version | File                  | Key Feature Added                            |
-|---------|-----------------------|----------------------------------------------|
-| 1.0     | Aceestver-1_0.py      | Base tkinter UI, program selector            |
-| 1.1     | Aceestver-1_1.py      | Calorie calculator, progress slider          |
-| 1.1.2   | Aceestver1_1_2.py     | Multi-client table, CSV export, charts       |
-| 2.0.1   | Aceestver2_0_1.py     | SQLite persistence, load/save client         |
-| 2.1.2   | Aceestver-2_1_2.py    | Progress logging to DB                       |
-| 2.2.1   | Aceestver-2_2_1.py    | Matplotlib adherence chart                   |
-| 2.2.4   | Aceestver-2_2_4.py    | Bug fixes and UI polish                      |
-| 3.0.1   | Aceestver-3_0_1.py    | Role-based login, workouts tab               |
-| 3.1.2   | Aceestver-3_1_2.py    | Metrics tracking, embedded charts            |
-| 3.2.4   | Aceestver-3_2_4.py    | PDF report, AI program generator (full app)  |
-| **API** | **app.py**            | **Flask REST API for CI/CD pipeline**        |
 
 ---
 
