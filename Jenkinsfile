@@ -25,7 +25,7 @@ pipeline {
         stage('Environment Setup') {
             steps {
                 bat '''
-                    "C:\\Users\\Sachin Jadhav\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe" -m venv venv
+                    python -m venv venv
                     call venv\\Scripts\\activate
                     pip install --upgrade pip
                     pip install -r requirements.txt
