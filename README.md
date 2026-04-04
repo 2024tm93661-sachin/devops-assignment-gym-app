@@ -267,17 +267,7 @@ On **failure**, a ❌ message is printed with a pointer to the failing stage log
 
 ---
 
-## Evaluation Checklist
 
-- [x] Flask application with all required endpoints
-- [x] Descriptive Git commit messages (see commit history)
-- [x] 40+ Pytest cases covering all endpoints and edge cases
-- [x] Optimised Dockerfile with non-root user and health check
-- [x] Jenkins BUILD pipeline (Jenkinsfile) with all stages
-- [x] GitHub Actions workflow triggering on push and pull_request
-- [x] Professional README with local setup, test, and CI/CD instructions
 
 ---
 
-*Submitted for the DevOps CI/CD Pipeline Assignment — ACEest Fitness & Gym.*
->>>>>>> 5728619 (docs: add professional README with setup guide)
