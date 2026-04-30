@@ -6,78 +6,71 @@
 
 pipeline {
     agent any
-    
-    tools {
-    git 'Default'
-    }
+
     environment {
-        IMAGE_NAME = "aceest-fitness"
-        IMAGE_TAG  = "${BUILD_NUMBER}"
+        IMAGE_NAME = "yourdockerhub/gym-app"
+        TAG = "v1.${BUILD_NUMBER}"
     }
 
     stages {
-        stage('Checkout') {
+
+        stage('Clone') {
             steps {
-                checkout scm
+                git 'https://github.com/2024tm93661-sachin/devops-assignment-gym-app.git'
             }
         }
 
-        stage('Environment Setup') {
+        stage('Install Dependencies') {
             steps {
-                bat '''
-                    python -m venv venv
-                    call venv\\Scripts\\activate
-                    pip install --upgrade pip
-                    pip install -r requirements.txt
-                '''
+                bat 'pip install -r requirements.txt'
             }
         }
 
-        stage('Lint') {
+        stage('Lint Check') {
             steps {
-                bat '''
-                    call venv\\Scripts\\activate
-                    flake8 app.py --max-line-length=120 --statistics
-                    flake8 . || exit 0
-                '''
+                bat 'flake8 .'
             }
         }
 
-        stage('Unit Tests') {
+        stage('Run Tests') {
             steps {
-                bat '''
-                    call venv\\Scripts\\activate
-                    pytest test_app.py -v --tb=short --junitxml=test-results.xml
-                '''
+                bat 'pytest --cov=app'
             }
-            post {
-                always {
-                    junit allowEmptyResults: true, testResults: '**/test-results.xml'
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                bat "docker build -t %IMAGE_NAME%:%TAG% ."
+            }
+        }
+
+        stage('Push to DockerHub') {
+            steps {
+                withCredentials([string(credentialsId: 'dockerhub-password', variable: 'PASS')]) {
+                    bat "docker login -u yourdockerhub -p %PASS%"
+                    bat "docker push %IMAGE_NAME%:%TAG%"
                 }
             }
         }
 
-        stage('Docker Build') {
+        stage('Deploy (Kubernetes)') {
             steps {
-                bat "docker build -t %IMAGE_NAME%:%IMAGE_TAG% ."
-                bat "docker tag %IMAGE_NAME%:%IMAGE_TAG% %IMAGE_NAME%:latest"
+                bat "kubectl set image deployment/gym-app gym-app=%IMAGE_NAME%:%TAG%"
             }
         }
 
-        stage('Docker Verify') {
+        stage('Rollback if Failed') {
+            when {
+                expression { currentBuild.result == 'FAILURE' }
+            }
             steps {
-                bat "docker images %IMAGE_NAME%"
-                bat "docker run --rm %IMAGE_NAME%:latest python -c \"import app; print('App import OK')\""
+                bat "kubectl rollout undo deployment/gym-app"
             }
         }
-    }
-
-    post {
-        success { echo '✅ BUILD SUCCESS' }
-        failure { echo '❌ BUILD FAILED' }
-        always {
-            bat "docker rmi %IMAGE_NAME%:%IMAGE_TAG% || exit 0"
-            cleanWs()
-        }
+		stage('SonarQube Analysis') {
+            steps {
+                 sh 'sonar-scanner'
+            }
+}
     }
 }
