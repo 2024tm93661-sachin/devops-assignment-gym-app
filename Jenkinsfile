@@ -1,76 +1,76 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// ACEest Fitness & Gym — Jenkinsfile
-// Declarative pipeline for the Jenkins BUILD phase.
-// Pulls latest code from GitHub and performs a clean build + test.
-// ─────────────────────────────────────────────────────────────────────────────
 
 pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "yourdockerhub/gym-app"
-        TAG = "v1.${BUILD_NUMBER}"
+        IMAGE_NAME = 'ghcr.io/2024tm93661-sachin/fitness-app'
     }
 
     stages {
-
-        stage('Clone') {
+        stage('Checkout') {
             steps {
-                git 'https://github.com/2024tm93661-sachin/devops-assignment-gym-app.git'
+                checkout scm
             }
         }
 
         stage('Install Dependencies') {
             steps {
-                bat 'python -m pip install -r requirements.txt'
+                sh '''
+                    python3 -m venv .venv
+                    .venv/bin/python -m pip install -r requirements.txt
+                    .venv/bin/python -m pip install pytest
+                '''
             }
         }
 
-        stage('Lint Check') {
+        stage('Automated Testing') {
             steps {
-                bat 'flake8 .'
+                sh '.venv/bin/python -m pytest -v'
             }
         }
 
-        stage('Run Tests') {
+        stage('Docker Build') {
             steps {
-                bat 'pytest --cov=app'
+                sh '''
+                    docker build \
+                      -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+                '''
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Push to GHCR') {
             steps {
-                bat "docker build -t %IMAGE_NAME%:%TAG% ."
-            }
-        }
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'github-container-registry',
+                        usernameVariable: 'GHCR_USER',
+                        passwordVariable: 'GHCR_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        export DOCKER_CONFIG="$(mktemp -d)"
+                        trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT
 
-        stage('Push to DockerHub') {
-            steps {
-                withCredentials([string(credentialsId: 'dockerhub-password', variable: 'PASS')]) {
-                    bat "docker login -u yourdockerhub -p %PASS%"
-                    bat "docker push %IMAGE_NAME%:%TAG%"
+                        printf '%s' "$GHCR_TOKEN" |
+                          docker login ghcr.io \
+                            -u "$GHCR_USER" \
+                            --password-stdin
+
+                        docker push ${IMAGE_NAME}:${BUILD_NUMBER}
+                    '''
                 }
             }
         }
+    }
 
-        stage('Deploy (Kubernetes)') {
-            steps {
-                bat "kubectl set image deployment/gym-app gym-app=%IMAGE_NAME%:%TAG%"
-            }
+    post {
+        success {
+            echo 'CI/CD completed: Docker image published to GHCR.'
         }
 
-        stage('Rollback if Failed') {
-            when {
-                expression { currentBuild.result == 'FAILURE' }
-            }
-            steps {
-                bat "kubectl rollout undo deployment/gym-app"
-            }
+        failure {
+            echo 'CI/CD failed. Check the console output.'
         }
-		stage('SonarQube Analysis') {
-            steps {
-                 sh 'sonar-scanner'
-            }
-}
     }
 }
