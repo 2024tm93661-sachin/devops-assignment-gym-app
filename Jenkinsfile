@@ -1,76 +1,55 @@
 
-pipeline {
-    agent any
+stage('Deploy to EC2-2') {
+    steps {
+        sshagent(credentials: ['aws-appserver-ssh']) {
+            sh '''
+                set -eu
 
-    environment {
-        IMAGE_NAME = 'ghcr.io/2024tm93661-sachin/fitness-app'
-    }
+                echo "Deploying image version: $BUILD_NUMBER"
 
-    stages {
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
-        }
+                ssh -o BatchMode=yes \
+                    -o StrictHostKeyChecking=yes \
+                    ubuntu@172.31.18.175 \
+                    "bash -s -- '$BUILD_NUMBER'" <<'REMOTE'
+set -eu
 
-        stage('Install Dependencies') {
-            steps {
-                sh '''
-                    python3 -m venv .venv
-                    .venv/bin/python -m pip install -r requirements.txt
-                    .venv/bin/python -m pip install pytest
-                '''
-            }
-        }
+VERSION="$1"
+IMAGE="ghcr.io/2024tm93661-sachin/fitness-app:$VERSION"
 
-        stage('Automated Testing') {
-            steps {
-                sh '.venv/bin/python -m pytest -v'
-            }
-        }
+echo "Pulling Docker image: $IMAGE"
+docker pull "$IMAGE"
 
-        stage('Docker Build') {
-            steps {
-                sh '''
-                    docker build \
-                      -t ${IMAGE_NAME}:${BUILD_NUMBER} .
-                '''
-            }
-        }
+echo "Replacing existing container"
+docker rm -f fitness-app 2>/dev/null || true
 
-        stage('Push to GHCR') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'github-container-registry',
-                        usernameVariable: 'GHCR_USER',
-                        passwordVariable: 'GHCR_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set +x
-                        export DOCKER_CONFIG="$(mktemp -d)"
-                        trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT
+docker run -d \
+    --name fitness-app \
+    --restart unless-stopped \
+    -p 5000:5000 \
+    "$IMAGE"
 
-                        printf '%s' "$GHCR_TOKEN" |
-                          docker login ghcr.io \
-                            -u "$GHCR_USER" \
-                            --password-stdin
+echo "Checking Flask application health"
 
-                        docker push ${IMAGE_NAME}:${BUILD_NUMBER}
-                    '''
-                }
-            }
-        }
-    }
+HEALTHY=0
 
-    post {
-        success {
-            echo 'CI/CD completed: Docker image published to GHCR.'
-        }
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS http://localhost:5000/health; then
+        HEALTHY=1
+        break
+    fi
 
-        failure {
-            echo 'CI/CD failed. Check the console output.'
+    sleep 3
+done
+
+if [ "$HEALTHY" -ne 1 ]; then
+    echo "ERROR: Application failed health check"
+    docker logs --tail 50 fitness-app
+    exit 1
+fi
+
+echo "Deployment successful"
+REMOTE
+            '''
         }
     }
 }
