@@ -1,4 +1,4 @@
-// Step 20: Complete AI-guided CI/CD candidate, with direct string parsing.
+// Step 20: AI-guided CI/CD benchmark with corrected runtime risk propagation.
 // Production deployment is OFF by default. Keep the original production job unchanged.
 // The predictor is trained on controlled experiments; do not treat its risk score as calibrated.
 
@@ -22,9 +22,6 @@ pipeline {
         IMAGE_REPO = 'ghcr.io/2024tm93661-sachin/fitness-app'
         APP_SERVER = '172.31.18.175'
         AI_DIR = '/home/ubuntu/ai-cicd-optimization'
-        AI_RISK = 'UNKNOWN'
-        AI_FAILURE_PROBABILITY = ''
-        AI_PREDICTION_STATUS = 'UNAVAILABLE'
         IMAGE_TAG = "ai-step19-${env.BUILD_NUMBER}"
     }
 
@@ -133,6 +130,9 @@ PY_RESULT
                     env.AI_RISK = readFile('ai_risk.txt').trim()
                     env.AI_PREDICTION_STATUS = readFile('ai_status.txt').trim()
                     env.AI_FAILURE_PROBABILITY = readFile('ai_probability.txt').trim()
+                    if (!(env.AI_RISK in ['HIGH', 'LOW', 'UNKNOWN'])) {
+                        error('Invalid AI risk classification from Python result')
+                    }
                     echo "AI integration: status=${env.AI_PREDICTION_STATUS}, risk=${env.AI_RISK}, probability=${env.AI_FAILURE_PROBABILITY}"
                 }
             }
@@ -141,6 +141,7 @@ PY_RESULT
         stage('High-Risk Early Docker Preflight') {
             when {
                 expression {
+                    echo "Preflight decision: mode=${params.PIPELINE_MODE}, override=${params.RISK_OVERRIDE}, runtimeRisk=${env.AI_RISK}"
                     return params.PIPELINE_MODE == 'AI_OPTIMIZED' && (
                         params.RISK_OVERRIDE == 'HIGH' ||
                         (params.RISK_OVERRIDE == 'AUTO' && env.AI_RISK == 'HIGH')
