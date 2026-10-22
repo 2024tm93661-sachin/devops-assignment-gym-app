@@ -38,18 +38,17 @@ pipeline {
         stage('AI Risk Assessment') {
             steps {
                 script {
-                    // Collect prediction in BOTH modes so the baseline includes the same AI overhead.
-                    // This is a fail-open advisory component, not a mandatory quality gate.
+                    // Python performs all numeric parsing and creates the JSON artifact.
+                    // Groovy only reads plain HIGH/LOW/UNKNOWN and SUCCESS/UNAVAILABLE text.
                     env.AI_RISK = 'UNKNOWN'
                     env.AI_FAILURE_PROBABILITY = ''
                     env.AI_PREDICTION_STATUS = 'UNAVAILABLE'
-                    int status = sh(script: '''
+                    sh '''
                         set -eu
                         AI_PYTHON="$AI_DIR/.venv/bin/python"
                         HISTORY="$AI_DIR/data/experimental_live_history.csv"
-                        rm -f ai_prediction.json ai_prediction.log
-                        : > ai_prediction.log
-                        CUTOFF="$("$AI_PYTHON" - "$HISTORY" <<'PY'
+                        rm -f ai_prediction.json ai_prediction.log ai_risk.txt ai_status.txt ai_probability.txt
+                        CUTOFF="$("$AI_PYTHON" - "$HISTORY" <<'PY_CUTOFF'
 import csv, sys
 with open(sys.argv[1], newline='') as f:
     rows = list(csv.DictReader(f))
@@ -64,66 +63,77 @@ for row in rows:
 if not values:
     raise SystemExit('No completed experimental history rows found')
 print(max(values) + 1)
-PY
-                        )"
-                        "$AI_PYTHON" "$AI_DIR/scripts/predict_pipeline_failure.py" \
-                          --model "$AI_DIR/models/jenkins_failure_model.joblib" \
-                          --history "$HISTORY" \
-                          --current-build "$CUTOFF" > ai_prediction.log 2>&1
-                    ''', returnStatus: true)
+PY_CUTOFF
+                        )" || CUTOFF=""
+                        PREDICT_EXIT=1
+                        if [ -n "$CUTOFF" ]; then
+                            if "$AI_PYTHON" "$AI_DIR/scripts/predict_pipeline_failure.py" \
+                              --model "$AI_DIR/models/jenkins_failure_model.joblib" \
+                              --history "$HISTORY" \
+                              --current-build "$CUTOFF" > ai_prediction.log 2>&1; then
+                                PREDICT_EXIT=0
+                            fi
+                        else
+                            printf '%s\n' 'Historical cutoff unavailable' > ai_prediction.log
+                        fi
+                        export PREDICT_EXIT
+                        "$AI_PYTHON" - <<'PY_RESULT'
+import json
+import math
+import os
 
-                    if (fileExists('ai_prediction.log')) {
-                        echo readFile('ai_prediction.log')
-                    }
-                    // Parse the existing log directly in Groovy using simple strings.
-                    // No regex Matcher, no second Python process, no JSON parser plugin.
-                    // The AI stage is advisory: parsing failure must not stop mandatory checks.
-                    if (status == 0 && fileExists('ai_prediction.log')) {
-                        def logText = readFile('ai_prediction.log')
-                        def probabilityLine = logText.readLines().find { line ->
-                            line.trim().startsWith('Estimated failure probability:')
-                        }
-                        if (probabilityLine != null) {
-                            try {
-                                def percentageText = probabilityLine.split(':', 2)[1]
-                                    .trim().replace('%', '').trim()
-                                double probability = Double.parseDouble(percentageText) / 100.0d
-                                if (Double.isNaN(probability) || Double.isInfinite(probability) ||
-                                    probability < 0.0d || probability > 1.0d) {
-                                    throw new IllegalArgumentException('Probability outside [0,1]')
-                                }
-                                env.AI_FAILURE_PROBABILITY = probability.toString()
-                                env.AI_RISK = probability >= 0.5d ? 'HIGH' : 'LOW'
-                                env.AI_PREDICTION_STATUS = 'SUCCESS'
-                                echo "AI prediction parsed: ${env.AI_FAILURE_PROBABILITY}; model risk=${env.AI_RISK}"
-                            } catch (Exception parseError) {
-                                echo "AI parsing failed: ${parseError.message}; continuing standard checks."
-                            }
-                        } else {
-                            echo 'AI probability line missing; continuing standard checks.'
-                        }
-                    } else {
-                        echo "AI predictor unavailable (exit ${status}); continuing standard checks."
-                    }
+with open('ai_prediction.log', encoding='utf-8') as f:
+    log = f.read()
 
-                    // Override is only for repeatable, clearly labeled experiments.
-                    if (params.RISK_OVERRIDE != 'AUTO') {
-                        env.AI_RISK = params.RISK_OVERRIDE
-                        echo "EXPERIMENTAL RISK OVERRIDE: ${env.AI_RISK} (not an AI decision)"
-                    }
+probability = None
+status = 'UNAVAILABLE'
+model_risk = 'UNKNOWN'
 
-                    writeFile file: 'ai_prediction.json', text: groovy.json.JsonOutput.toJson([
-                        job: env.JOB_NAME,
-                        build_number: env.BUILD_NUMBER,
-                        pipeline_mode: params.PIPELINE_MODE,
-                        model_probability: env.AI_FAILURE_PROBABILITY ? env.AI_FAILURE_PROBABILITY.toDouble() : null,
-                        model_status: env.AI_PREDICTION_STATUS,
-                        selected_risk: env.AI_RISK,
-                        risk_override: params.RISK_OVERRIDE,
-                        history_source: 'experimental_live_history.csv',
-                        model_validated_for_production: false
-                    ])
-                    echo "Selected risk=${env.AI_RISK}; pipeline mode=${params.PIPELINE_MODE}"
+if os.environ.get('PREDICT_EXIT') == '0':
+    prefix = 'Estimated failure probability:'
+    for line in log.splitlines():
+        if line.strip().startswith(prefix):
+            try:
+                percent = float(line.strip()[len(prefix):].strip().rstrip('%').strip())
+                if math.isfinite(percent) and 0 <= percent <= 100:
+                    probability = round(percent / 100.0, 6)
+                    model_risk = 'HIGH' if probability >= 0.5 else 'LOW'
+                    status = 'SUCCESS'
+            except ValueError:
+                pass
+            break
+
+override = os.environ.get('RISK_OVERRIDE', 'AUTO')
+selected = override if override in ('HIGH', 'LOW') else model_risk
+record = {
+    'job': os.environ.get('JOB_NAME', ''),
+    'build_number': os.environ.get('BUILD_NUMBER', ''),
+    'pipeline_mode': os.environ.get('PIPELINE_MODE', ''),
+    'model_probability': probability,
+    'model_status': status,
+    'selected_risk': selected,
+    'risk_override': override,
+    'history_source': 'experimental_live_history.csv',
+    'model_validated_for_production': False
+}
+with open('ai_prediction.json', 'w', encoding='utf-8') as f:
+    json.dump(record, f, indent=2)
+with open('ai_risk.txt', 'w', encoding='utf-8') as f:
+    f.write(selected)
+with open('ai_status.txt', 'w', encoding='utf-8') as f:
+    f.write(status)
+with open('ai_probability.txt', 'w', encoding='utf-8') as f:
+    f.write('' if probability is None else str(probability))
+print('AI model status=' + status)
+print('AI selected risk=' + selected)
+print('AI parsed probability=' + str(probability))
+PY_RESULT
+                    '''
+                    echo readFile('ai_prediction.log')
+                    env.AI_RISK = readFile('ai_risk.txt').trim()
+                    env.AI_PREDICTION_STATUS = readFile('ai_status.txt').trim()
+                    env.AI_FAILURE_PROBABILITY = readFile('ai_probability.txt').trim()
+                    echo "AI integration: status=${env.AI_PREDICTION_STATUS}, risk=${env.AI_RISK}, probability=${env.AI_FAILURE_PROBABILITY}"
                 }
             }
         }
@@ -255,7 +265,7 @@ REMOTE
                     mode: params.PIPELINE_MODE,
                     risk: env.AI_RISK,
                     model_status: env.AI_PREDICTION_STATUS,
-                    model_probability: env.AI_FAILURE_PROBABILITY ? env.AI_FAILURE_PROBABILITY.toDouble() : null,
+                    model_probability_text: env.AI_FAILURE_PROBABILITY ?: null,
                     risk_override: params.RISK_OVERRIDE,
                     deployment_enabled: params.ENABLE_DEPLOY,
                     result: currentBuild.currentResult,
