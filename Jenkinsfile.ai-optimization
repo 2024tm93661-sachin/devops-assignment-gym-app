@@ -40,10 +40,14 @@ pipeline {
                 script {
                     // Collect prediction in BOTH modes so the baseline includes the same AI overhead.
                     // This is a fail-open advisory component, not a mandatory quality gate.
+                    env.AI_RISK = 'UNKNOWN'
+                    env.AI_FAILURE_PROBABILITY = ''
+                    env.AI_PREDICTION_STATUS = 'UNAVAILABLE'
                     int status = sh(script: '''
                         set -eu
                         AI_PYTHON="$AI_DIR/.venv/bin/python"
                         HISTORY="$AI_DIR/data/experimental_live_history.csv"
+                        rm -f ai_risk_result.json ai_prediction.log
                         : > ai_prediction.log
                         CUTOFF="$("$AI_PYTHON" - "$HISTORY" <<'PY'
 import csv, sys
@@ -71,35 +75,47 @@ PY
                     if (fileExists('ai_prediction.log')) {
                         echo readFile('ai_prediction.log')
                     }
-                    // Parse the predictor's human-readable output without regex Matcher
-                    // or nested Python heredocs. This avoids Groovy CPS and shell quoting issues.
+                    // Parse the predictor output in Python, not in CPS Groovy.
+                    // Keep a structured result, and fail open on prediction errors.
                     if (status == 0 && fileExists('ai_prediction.log')) {
-                        String probabilityLine = readFile('ai_prediction.log').readLines().find { line ->
-                            line.trim().startsWith('Estimated failure probability:')
-                        }
-                        if (probabilityLine != null) {
-                            try {
-                                String percentageText = probabilityLine.substring(
-                                    probabilityLine.indexOf(':') + 1
-                                ).trim().replace('%', '').trim()
-                                double probability = percentageText.toDouble() / 100.0d
-                                if (probability >= 0.0d && probability <= 1.0d) {
-                                    env.AI_FAILURE_PROBABILITY = probability.toString()
-                                    env.AI_RISK = probability >= 0.5d ? 'HIGH' : 'LOW'
-                                    env.AI_PREDICTION_STATUS = 'SUCCESS'
-                                    writeFile file: 'ai_probability.txt', text: env.AI_FAILURE_PROBABILITY + '\n'
-                                    echo "AI prediction parsed: ${env.AI_FAILURE_PROBABILITY}; model risk=${env.AI_RISK}"
-                                } else {
-                                    echo "AI probability outside [0,1]: ${probability}"
-                                }
-                            } catch (NumberFormatException ignored) {
-                                echo "Unable to parse AI probability from: ${probabilityLine}"
-                            }
+                        int parseStatus = sh(script: '''
+                            set -eu
+                            "$AI_DIR/.venv/bin/python" - <<'PY_PARSE'
+import json
+from pathlib import Path
+
+text = Path('ai_prediction.log').read_text(encoding='utf-8')
+needle = 'Estimated failure probability:'
+probability = None
+for line in text.splitlines():
+    if needle in line:
+        raw = line.split(needle, 1)[1].strip()
+        if not raw.endswith('%'):
+            raise ValueError('Prediction value is missing % sign')
+        probability = float(raw[:-1].strip()) / 100.0
+        break
+if probability is None or not (0.0 <= probability <= 1.0):
+    raise ValueError('Missing or invalid probability in ai_prediction.log')
+risk = 'HIGH' if probability >= 0.5 else 'LOW'
+Path('ai_risk_result.json').write_text(
+    json.dumps({'model_probability': probability,
+                'model_status': 'SUCCESS',
+                'model_risk': risk}) + '\n',
+    encoding='utf-8')
+print(f'Parsed AI probability={probability:.3f}, risk={risk}')
+PY_PARSE
+                        ''', returnStatus: true)
+                        if (parseStatus == 0 && fileExists('ai_risk_result.json')) {
+                            def parsed = new groovy.json.JsonSlurperClassic().parseText(readFile('ai_risk_result.json'))
+                            env.AI_FAILURE_PROBABILITY = parsed.model_probability.toString()
+                            env.AI_RISK = parsed.model_risk.toString()
+                            env.AI_PREDICTION_STATUS = 'SUCCESS'
+                            echo "AI prediction parsed: ${env.AI_FAILURE_PROBABILITY}; model risk=${env.AI_RISK}"
                         } else {
-                            echo 'AI probability line missing from prediction log.'
+                            echo "AI output parsing unavailable (exit ${parseStatus}); continuing mandatory checks."
                         }
                     } else {
-                        echo "AI predictor exited with status ${status}; continuing mandatory checks."
+                        echo "AI predictor unavailable (exit ${status}); continuing mandatory checks."
                     }
 
                     // Override is only for repeatable, clearly labeled experiments.
@@ -243,7 +259,7 @@ REMOTE
 
     post {
         always {
-            archiveArtifacts artifacts: 'ai_prediction.json,ai_prediction.log,ai_probability.txt', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'ai_prediction.json,ai_prediction.log,ai_risk_result.json', allowEmptyArchive: true
             script {
                 writeFile file: 'optimization_run.json', text: groovy.json.JsonOutput.toJson([
                     job: env.JOB_NAME,
