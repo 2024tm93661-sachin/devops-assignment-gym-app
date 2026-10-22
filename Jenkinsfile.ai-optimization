@@ -1,4 +1,4 @@
-// Step 19: AI-guided early validation on real application builds.
+// Step 20: Complete AI-guided CI/CD candidate, with direct string parsing.
 // Production deployment is OFF by default. Keep the original production job unchanged.
 // The predictor is trained on controlled experiments; do not treat its risk score as calibrated.
 
@@ -47,7 +47,7 @@ pipeline {
                         set -eu
                         AI_PYTHON="$AI_DIR/.venv/bin/python"
                         HISTORY="$AI_DIR/data/experimental_live_history.csv"
-                        rm -f ai_risk_result.json ai_prediction.log
+                        rm -f ai_prediction.json ai_prediction.log
                         : > ai_prediction.log
                         CUTOFF="$("$AI_PYTHON" - "$HISTORY" <<'PY'
 import csv, sys
@@ -75,47 +75,35 @@ PY
                     if (fileExists('ai_prediction.log')) {
                         echo readFile('ai_prediction.log')
                     }
-                    // Parse the predictor output in Python, not in CPS Groovy.
-                    // Keep a structured result, and fail open on prediction errors.
+                    // Parse the existing log directly in Groovy using simple strings.
+                    // No regex Matcher, no second Python process, no JSON parser plugin.
+                    // The AI stage is advisory: parsing failure must not stop mandatory checks.
                     if (status == 0 && fileExists('ai_prediction.log')) {
-                        int parseStatus = sh(script: '''
-                            set -eu
-                            "$AI_DIR/.venv/bin/python" - <<'PY_PARSE'
-import json
-from pathlib import Path
-
-text = Path('ai_prediction.log').read_text(encoding='utf-8')
-needle = 'Estimated failure probability:'
-probability = None
-for line in text.splitlines():
-    if needle in line:
-        raw = line.split(needle, 1)[1].strip()
-        if not raw.endswith('%'):
-            raise ValueError('Prediction value is missing % sign')
-        probability = float(raw[:-1].strip()) / 100.0
-        break
-if probability is None or not (0.0 <= probability <= 1.0):
-    raise ValueError('Missing or invalid probability in ai_prediction.log')
-risk = 'HIGH' if probability >= 0.5 else 'LOW'
-Path('ai_risk_result.json').write_text(
-    json.dumps({'model_probability': probability,
-                'model_status': 'SUCCESS',
-                'model_risk': risk}) + '\n',
-    encoding='utf-8')
-print(f'Parsed AI probability={probability:.3f}, risk={risk}')
-PY_PARSE
-                        ''', returnStatus: true)
-                        if (parseStatus == 0 && fileExists('ai_risk_result.json')) {
-                            def parsed = new groovy.json.JsonSlurperClassic().parseText(readFile('ai_risk_result.json'))
-                            env.AI_FAILURE_PROBABILITY = parsed.model_probability.toString()
-                            env.AI_RISK = parsed.model_risk.toString()
-                            env.AI_PREDICTION_STATUS = 'SUCCESS'
-                            echo "AI prediction parsed: ${env.AI_FAILURE_PROBABILITY}; model risk=${env.AI_RISK}"
+                        def logText = readFile('ai_prediction.log')
+                        def probabilityLine = logText.readLines().find { line ->
+                            line.trim().startsWith('Estimated failure probability:')
+                        }
+                        if (probabilityLine != null) {
+                            try {
+                                def percentageText = probabilityLine.split(':', 2)[1]
+                                    .trim().replace('%', '').trim()
+                                double probability = Double.parseDouble(percentageText) / 100.0d
+                                if (Double.isNaN(probability) || Double.isInfinite(probability) ||
+                                    probability < 0.0d || probability > 1.0d) {
+                                    throw new IllegalArgumentException('Probability outside [0,1]')
+                                }
+                                env.AI_FAILURE_PROBABILITY = probability.toString()
+                                env.AI_RISK = probability >= 0.5d ? 'HIGH' : 'LOW'
+                                env.AI_PREDICTION_STATUS = 'SUCCESS'
+                                echo "AI prediction parsed: ${env.AI_FAILURE_PROBABILITY}; model risk=${env.AI_RISK}"
+                            } catch (Exception parseError) {
+                                echo "AI parsing failed: ${parseError.message}; continuing standard checks."
+                            }
                         } else {
-                            echo "AI output parsing unavailable (exit ${parseStatus}); continuing mandatory checks."
+                            echo 'AI probability line missing; continuing standard checks.'
                         }
                     } else {
-                        echo "AI predictor unavailable (exit ${status}); continuing mandatory checks."
+                        echo "AI predictor unavailable (exit ${status}); continuing standard checks."
                     }
 
                     // Override is only for repeatable, clearly labeled experiments.
@@ -259,7 +247,7 @@ REMOTE
 
     post {
         always {
-            archiveArtifacts artifacts: 'ai_prediction.json,ai_prediction.log,ai_risk_result.json', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'ai_prediction.json,ai_prediction.log', allowEmptyArchive: true
             script {
                 writeFile file: 'optimization_run.json', text: groovy.json.JsonOutput.toJson([
                     job: env.JOB_NAME,
