@@ -45,7 +45,6 @@ pipeline {
                         AI_PYTHON="$AI_DIR/.venv/bin/python"
                         HISTORY="$AI_DIR/data/experimental_live_history.csv"
                         : > ai_prediction.log
-                        : > ai_probability.txt
                         CUTOFF="$("$AI_PYTHON" - "$HISTORY" <<'PY'
 import csv, sys
 with open(sys.argv[1], newline='') as f:
@@ -67,30 +66,40 @@ PY
                           --model "$AI_DIR/models/jenkins_failure_model.joblib" \
                           --history "$HISTORY" \
                           --current-build "$CUTOFF" > ai_prediction.log 2>&1
-                        "$AI_PYTHON" - <<'PY'
-import re
-from pathlib import Path
-log = Path('ai_prediction.log').read_text()
-m = re.search(r'Estimated failure probability: *([0-9]+(?:[.][0-9]+)?)%', log)
-if not m:
-    raise SystemExit('Could not parse AI probability')
-p = float(m.group(1)) / 100.0
-if not 0 <= p <= 1:
-    raise SystemExit('Probability outside [0,1]')
-Path('ai_probability.txt').write_text(str(p))
-PY
                     ''', returnStatus: true)
 
                     if (fileExists('ai_prediction.log')) {
                         echo readFile('ai_prediction.log')
                     }
-                    if (status == 0 && fileExists('ai_probability.txt') && readFile('ai_probability.txt').trim()) {
-                        double probability = readFile('ai_probability.txt').trim().toDouble()
-                        env.AI_FAILURE_PROBABILITY = probability.toString()
-                        env.AI_RISK = probability >= 0.5 ? 'HIGH' : 'LOW'
-                        env.AI_PREDICTION_STATUS = 'SUCCESS'
+                    // Parse the predictor's human-readable output without regex Matcher
+                    // or nested Python heredocs. This avoids Groovy CPS and shell quoting issues.
+                    if (status == 0 && fileExists('ai_prediction.log')) {
+                        String probabilityLine = readFile('ai_prediction.log').readLines().find { line ->
+                            line.trim().startsWith('Estimated failure probability:')
+                        }
+                        if (probabilityLine != null) {
+                            try {
+                                String percentageText = probabilityLine.substring(
+                                    probabilityLine.indexOf(':') + 1
+                                ).trim().replace('%', '').trim()
+                                double probability = percentageText.toDouble() / 100.0d
+                                if (probability >= 0.0d && probability <= 1.0d) {
+                                    env.AI_FAILURE_PROBABILITY = probability.toString()
+                                    env.AI_RISK = probability >= 0.5d ? 'HIGH' : 'LOW'
+                                    env.AI_PREDICTION_STATUS = 'SUCCESS'
+                                    writeFile file: 'ai_probability.txt', text: env.AI_FAILURE_PROBABILITY + '\n'
+                                    echo "AI prediction parsed: ${env.AI_FAILURE_PROBABILITY}; model risk=${env.AI_RISK}"
+                                } else {
+                                    echo "AI probability outside [0,1]: ${probability}"
+                                }
+                            } catch (NumberFormatException ignored) {
+                                echo "Unable to parse AI probability from: ${probabilityLine}"
+                            }
+                        } else {
+                            echo 'AI probability line missing from prediction log.'
+                        }
                     } else {
-                        echo "AI prediction unavailable (exit ${status}); using standard checks."
+                        echo "AI predictor exited with status ${status}; continuing mandatory checks."
                     }
 
                     // Override is only for repeatable, clearly labeled experiments.
@@ -103,7 +112,7 @@ PY
                         job: env.JOB_NAME,
                         build_number: env.BUILD_NUMBER,
                         pipeline_mode: params.PIPELINE_MODE,
-                        model_probability: env.AI_FAILURE_PROBABILITY ?: null,
+                        model_probability: env.AI_FAILURE_PROBABILITY ? env.AI_FAILURE_PROBABILITY.toDouble() : null,
                         model_status: env.AI_PREDICTION_STATUS,
                         selected_risk: env.AI_RISK,
                         risk_override: params.RISK_OVERRIDE,
@@ -116,32 +125,26 @@ PY
         }
 
         stage('High-Risk Early Docker Preflight') {
-    when {
-        expression {
-            return params.PIPELINE_MODE == 'AI_OPTIMIZED' &&
-                   (
-                       params.RISK_OVERRIDE == 'HIGH' ||
-                       (
-                           params.RISK_OVERRIDE == 'AUTO' &&
-                           env.AI_RISK == 'HIGH'
-                       )
-                   )
+            when {
+                expression {
+                    return params.PIPELINE_MODE == 'AI_OPTIMIZED' && (
+                        params.RISK_OVERRIDE == 'HIGH' ||
+                        (params.RISK_OVERRIDE == 'AUTO' && env.AI_RISK == 'HIGH')
+                    )
+                }
+            }
+            steps {
+                // Cheap independent checks before installing Python dependencies.
+                // A genuine Docker-daemon outage can fail here rather than after tests.
+                sh '''
+                    set -eu
+                    test -f Dockerfile
+                    test -f requirements.txt
+                    docker info >/dev/null
+                    echo 'High-risk preflight passed.'
+                '''
+            }
         }
-    }
-
-    steps {
-        echo "Running early Docker preflight"
-        echo "Pipeline mode: ${params.PIPELINE_MODE}"
-        echo "Risk override: ${params.RISK_OVERRIDE}"
-        echo "AI predicted risk: ${env.AI_RISK}"
-
-        sh '''
-            set -eu
-            docker info > /dev/null
-            echo "Docker preflight passed"
-        '''
-    }
-}
 
         stage('Install Dependencies') {
             steps {
@@ -248,7 +251,7 @@ REMOTE
                     mode: params.PIPELINE_MODE,
                     risk: env.AI_RISK,
                     model_status: env.AI_PREDICTION_STATUS,
-                    model_probability: env.AI_FAILURE_PROBABILITY ?: null,
+                    model_probability: env.AI_FAILURE_PROBABILITY ? env.AI_FAILURE_PROBABILITY.toDouble() : null,
                     risk_override: params.RISK_OVERRIDE,
                     deployment_enabled: params.ENABLE_DEPLOY,
                     result: currentBuild.currentResult,
