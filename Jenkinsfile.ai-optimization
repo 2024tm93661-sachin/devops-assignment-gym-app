@@ -25,16 +25,13 @@ pipeline {
         AI_RISK = 'UNKNOWN'
         AI_FAILURE_PROBABILITY = ''
         AI_PREDICTION_STATUS = 'UNAVAILABLE'
-        IMAGE_TAG = ''
+        IMAGE_TAG = "ai-step19-${env.BUILD_NUMBER}"
     }
 
     stages {
         stage('Checkout Source') {
             steps {
                 checkout scm
-                script {
-                    env.IMAGE_TAG = "ai-step19-${env.BUILD_NUMBER}"
-                }
             }
         }
 
