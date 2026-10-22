@@ -1,0 +1,263 @@
+// Step 19: AI-guided early validation on real application builds.
+// Production deployment is OFF by default. Keep the original production job unchanged.
+// The predictor is trained on controlled experiments; do not treat its risk score as calibrated.
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '60'))
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        choice(name: 'PIPELINE_MODE', choices: ['BASELINE', 'AI_OPTIMIZED'], description: 'Both modes run the same mandatory tests and Docker build. AI_OPTIMIZED can run an early Docker preflight for high-risk builds.')
+        choice(name: 'RISK_OVERRIDE', choices: ['AUTO', 'HIGH', 'LOW'], description: 'AUTO uses the AI prediction. HIGH/LOW are for controlled experiments only; never use an override for production decisions.')
+        booleanParam(name: 'ENABLE_DEPLOY', defaultValue: false, description: 'CAUTION: true pushes to GHCR and replaces the running EC2-2 application.')
+    }
+
+    environment {
+        IMAGE_REPO = 'ghcr.io/2024tm93661-sachin/fitness-app'
+        APP_SERVER = '172.31.18.175'
+        AI_DIR = '/home/ubuntu/ai-cicd-optimization'
+        AI_RISK = 'UNKNOWN'
+        AI_FAILURE_PROBABILITY = ''
+        AI_PREDICTION_STATUS = 'UNAVAILABLE'
+        IMAGE_TAG = ''
+    }
+
+    stages {
+        stage('Checkout Source') {
+            steps {
+                checkout scm
+                script {
+                    env.IMAGE_TAG = "ai-step19-${env.BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('AI Risk Assessment') {
+            steps {
+                script {
+                    // Collect prediction in BOTH modes so the baseline includes the same AI overhead.
+                    // This is a fail-open advisory component, not a mandatory quality gate.
+                    int status = sh(script: '''
+                        set -eu
+                        AI_PYTHON="$AI_DIR/.venv/bin/python"
+                        HISTORY="$AI_DIR/data/experimental_live_history.csv"
+                        : > ai_prediction.log
+                        : > ai_probability.txt
+                        CUTOFF="$("$AI_PYTHON" - "$HISTORY" <<'PY'
+import csv, sys
+with open(sys.argv[1], newline='') as f:
+    rows = list(csv.DictReader(f))
+values = []
+for row in rows:
+    result = (row.get('actual_result') or row.get('result') or '').upper()
+    if result in ('SUCCESS', 'FAILURE'):
+        try:
+            values.append(int(row['build_number']))
+        except (KeyError, ValueError, TypeError):
+            pass
+if not values:
+    raise SystemExit('No completed experimental history rows found')
+print(max(values) + 1)
+PY
+                        )"
+                        "$AI_PYTHON" "$AI_DIR/scripts/predict_pipeline_failure.py" \
+                          --model "$AI_DIR/models/jenkins_failure_model.joblib" \
+                          --history "$HISTORY" \
+                          --current-build "$CUTOFF" > ai_prediction.log 2>&1
+                        "$AI_PYTHON" - <<'PY'
+import re
+from pathlib import Path
+log = Path('ai_prediction.log').read_text()
+m = re.search(r'Estimated failure probability:\s*([0-9]+(?:\.[0-9]+)?)%', log)
+if not m:
+    raise SystemExit('Could not parse AI probability')
+p = float(m.group(1)) / 100.0
+if not 0 <= p <= 1:
+    raise SystemExit('Probability outside [0,1]')
+Path('ai_probability.txt').write_text(str(p))
+PY
+                    ''', returnStatus: true)
+
+                    if (fileExists('ai_prediction.log')) {
+                        echo readFile('ai_prediction.log')
+                    }
+                    if (status == 0 && fileExists('ai_probability.txt') && readFile('ai_probability.txt').trim()) {
+                        double probability = readFile('ai_probability.txt').trim().toDouble()
+                        env.AI_FAILURE_PROBABILITY = probability.toString()
+                        env.AI_RISK = probability >= 0.5 ? 'HIGH' : 'LOW'
+                        env.AI_PREDICTION_STATUS = 'SUCCESS'
+                    } else {
+                        echo "AI prediction unavailable (exit ${status}); using standard checks."
+                    }
+
+                    // Override is only for repeatable, clearly labeled experiments.
+                    if (params.RISK_OVERRIDE != 'AUTO') {
+                        env.AI_RISK = params.RISK_OVERRIDE
+                        echo "EXPERIMENTAL RISK OVERRIDE: ${env.AI_RISK} (not an AI decision)"
+                    }
+
+                    writeFile file: 'ai_prediction.json', text: groovy.json.JsonOutput.toJson([
+                        job: env.JOB_NAME,
+                        build_number: env.BUILD_NUMBER,
+                        pipeline_mode: params.PIPELINE_MODE,
+                        model_probability: env.AI_FAILURE_PROBABILITY ?: null,
+                        model_status: env.AI_PREDICTION_STATUS,
+                        selected_risk: env.AI_RISK,
+                        risk_override: params.RISK_OVERRIDE,
+                        history_source: 'experimental_live_history.csv',
+                        model_validated_for_production: false
+                    ])
+                    echo "Selected risk=${env.AI_RISK}; pipeline mode=${params.PIPELINE_MODE}"
+                }
+            }
+        }
+
+        stage('High-Risk Early Docker Preflight') {
+            when {
+                expression {
+                    params.PIPELINE_MODE == 'AI_OPTIMIZED' && env.AI_RISK == 'HIGH'
+                }
+            }
+            steps {
+                // Cheap independent checks before installing Python dependencies.
+                // A genuine Docker-daemon outage can fail here rather than after tests.
+                sh '''
+                    set -eu
+                    test -f Dockerfile
+                    test -f requirements.txt
+                    docker info >/dev/null
+                    echo 'High-risk preflight passed.'
+                '''
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    set -eu
+                    python3 -m venv .venv
+                    . .venv/bin/activate
+                    python -m pip install --upgrade pip
+                    python -m pip install -r requirements.txt
+                    python -m pip install pytest
+                '''
+            }
+        }
+
+        stage('Automated Tests') {
+            steps {
+                sh '''
+                    set -eu
+                    . .venv/bin/activate
+                    python -m pytest -v
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    set -eu
+                    # Mandatory for both modes; catches Docker outages in BASELINE too.
+                    docker info >/dev/null
+                    docker build -t "$IMAGE_REPO:$IMAGE_TAG" .
+                '''
+            }
+        }
+
+        stage('Push Image to GHCR') {
+            when { expression { params.ENABLE_DEPLOY } }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-container-registry',
+                    usernameVariable: 'GHCR_USER',
+                    passwordVariable: 'GHCR_TOKEN'
+                )]) {
+                    sh '''
+                        set -eu
+                        export DOCKER_CONFIG="$(mktemp -d)"
+                        trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+                        printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+                        docker push "$IMAGE_REPO:$IMAGE_TAG"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EC2-2') {
+            when { expression { params.ENABLE_DEPLOY } }
+            steps {
+                sshagent(credentials: ['aws-appserver-ssh']) {
+                    sh '''
+                        set -eu
+                        ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+                            "ubuntu@$APP_SERVER" "bash -s -- '$IMAGE_TAG'" <<'REMOTE'
+set -eu
+VERSION="$1"
+IMAGE="ghcr.io/2024tm93661-sachin/fitness-app:$VERSION"
+echo "Pulling $IMAGE"
+docker pull "$IMAGE"
+OLD_IMAGE="$(docker inspect fitness-app --format '{{.Config.Image}}' 2>/dev/null || true)"
+docker rm -f fitness-app 2>/dev/null || true
+docker run -d --name fitness-app --restart unless-stopped -p 5000:5000 "$IMAGE"
+healthy=0
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS http://localhost:5000/health >/dev/null; then
+        healthy=1
+        break
+    fi
+    sleep 3
+done
+if [ "$healthy" -ne 1 ]; then
+    echo 'New container failed its health check'
+    docker logs --tail 50 fitness-app || true
+    docker rm -f fitness-app || true
+    if [ -n "$OLD_IMAGE" ]; then
+        echo "Attempting rollback to $OLD_IMAGE"
+        docker run -d --name fitness-app --restart unless-stopped -p 5000:5000 "$OLD_IMAGE" || true
+    fi
+    exit 1
+fi
+echo "Deployment successful: $IMAGE"
+REMOTE
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'ai_prediction.json,ai_prediction.log,ai_probability.txt', allowEmptyArchive: true
+            script {
+                writeFile file: 'optimization_run.json', text: groovy.json.JsonOutput.toJson([
+                    job: env.JOB_NAME,
+                    build_number: env.BUILD_NUMBER,
+                    mode: params.PIPELINE_MODE,
+                    risk: env.AI_RISK,
+                    model_status: env.AI_PREDICTION_STATUS,
+                    model_probability: env.AI_FAILURE_PROBABILITY ?: null,
+                    risk_override: params.RISK_OVERRIDE,
+                    deployment_enabled: params.ENABLE_DEPLOY,
+                    result: currentBuild.currentResult,
+                    duration_ms: currentBuild.duration,
+                    commit: env.GIT_COMMIT ?: null
+                ])
+                archiveArtifacts artifacts: 'optimization_run.json', allowEmptyArchive: false
+            }
+            sh 'rm -rf .venv || true'
+        }
+        success {
+            echo "SUCCESS: ${params.PIPELINE_MODE} completed for ${env.IMAGE_REPO}:${env.IMAGE_TAG}"
+        }
+        failure {
+            echo 'FAILED: Inspect the failing stage; production job remains unchanged.'
+        }
+    }
+}
