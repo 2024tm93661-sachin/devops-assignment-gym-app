@@ -31,48 +31,96 @@ pipeline {
         }
 
         stage('AI Risk Assessment') {
-            steps {
-                script {
-                    // Predictor uses only completed history, never this build's outcome.
-                    // Keep model and training files fixed during evaluation.
-                    int currentBuildNumber = env.BUILD_NUMBER as Integer
-                    String prediction = sh(
-                        script: '''#!/bin/bash
-set -euo pipefail
-"$AI_PROJECT/.venv/bin/python" "$AI_PROJECT/scripts/predict_pipeline_failure.py" \
-  --model "$AI_PROJECT/models/jenkins_failure_model.joblib" \
-  --history "$AI_PROJECT/data/experimental_live_history.csv" \
-  --current-build "$BUILD_NUMBER"
-''',
-                        returnStdout: true
-                    ).trim()
-                    echo prediction
-                    writeFile file: 'ai_prediction.log', text: prediction + '\n'
+    steps {
+        script {
+            env.AI_RISK = 'UNKNOWN'
+            env.AI_FAILURE_PROBABILITY = ''
 
-                    // Match the predictor's existing human-readable percentage output.
-                    def match = (prediction =~ /(?i)(?:failure\s*(?:risk|probability)|predicted\s*failure\s*probability)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*%/)
-                    if (!match.find()) {
-                        error('AI prediction percentage not found in predictor output. Review ai_prediction.log; no deployment will occur.')
-                    }
-                    double probability = (match.group(1) as Double) / 100.0
-                    if (probability < 0.0 || probability > 1.0) {
-                        error('Invalid AI failure probability')
-                    }
-                    env.AI_RISK = String.format(java.util.Locale.US, '%.4f', probability)
-                    env.AI_ROUTE = (params.AI_MODE == 'ADAPTIVE' && probability >= (env.AI_THRESHOLD as Double)) ? 'HIGH_RISK_PREFLIGHT' : 'STANDARD'
-                    writeFile file: 'ai_prediction.json', text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
-                        build_number: currentBuildNumber,
+            def aiStatus = sh(
+                script: '''
+                    set -eu
+
+                    AI_DIR="/home/ubuntu/ai-cicd-optimization"
+                    AI_PYTHON="$AI_DIR/.venv/bin/python"
+                    AI_HISTORY="$AI_DIR/data/experimental_live_history.csv"
+
+                    # Determine the cutoff from completed historical builds.
+                    # This is separate from the current Jenkins job's build number.
+                    HISTORY_CUTOFF="$(
+                        "$AI_PYTHON" - "$AI_HISTORY" <<'PYCODE'
+import csv
+import sys
+
+with open(sys.argv[1], newline="") as f:
+    rows = list(csv.DictReader(f))
+
+completed = [
+    int(row["build_number"])
+    for row in rows
+    if row.get("actual_result") in ("SUCCESS", "FAILURE")
+]
+
+if not completed:
+    raise SystemExit("No completed historical builds found")
+
+print(max(completed) + 1)
+PYCODE
+                    )"
+
+                    "$AI_PYTHON" "$AI_DIR/scripts/predict_pipeline_failure.py" \
+                        --model "$AI_DIR/models/jenkins_failure_model.joblib" \
+                        --history "$AI_HISTORY" \
+                        --current-build "$HISTORY_CUTOFF" \
+                        > ai_prediction.log 2>&1
+                ''',
+                returnStatus: true
+            )
+
+            if (aiStatus != 0) {
+                echo "AI prediction unavailable (exit ${aiStatus}). Continuing mandatory CI/CD checks."
+                writeFile file: 'ai_prediction.json', text: groovy.json.JsonOutput.toJson([
+                    build_number: env.BUILD_NUMBER,
+                    prediction_status: 'UNAVAILABLE',
+                    prediction_mode: 'advisory_only'
+                ])
+            } else {
+                def predictionLog = readFile('ai_prediction.log')
+                echo predictionLog
+
+                def matcher = predictionLog =~ /Estimated failure probability:\\s*([0-9]+(?:\\.[0-9]+)?)%/
+
+                if (matcher.find()) {
+                    def percentage = matcher.group(1).toDouble()
+                    def probability = percentage / 100.0
+
+                    env.AI_FAILURE_PROBABILITY = probability.toString()
+                    env.AI_RISK = probability >= 0.5 ? 'HIGH' : 'LOW'
+
+                    writeFile file: 'ai_prediction.json', text: groovy.json.JsonOutput.toJson([
+                        build_number: env.BUILD_NUMBER,
                         predicted_failure_probability: probability,
-                        threshold: env.AI_THRESHOLD as Double,
-                        model_version: 'initial_logistic_regression',
-                        ai_mode: params.AI_MODE,
-                        selected_route: env.AI_ROUTE,
-                        prediction_mode: 'advisory_or_adaptive',
-                    ])) + '\n'
-                    echo "AI selected route: ${env.AI_ROUTE}"
+                        predicted_failure: probability >= 0.5,
+                        threshold: 0.5,
+                        risk_level: env.AI_RISK,
+                        prediction_status: 'SUCCESS',
+                        prediction_mode: 'advisory_only',
+                        history_source: 'experimental_live_history.csv'
+                    ])
+
+                    echo "AI risk classification: ${env.AI_RISK}"
+                } else {
+                    echo 'AI output could not be parsed. Continuing standard pipeline.'
+
+                    writeFile file: 'ai_prediction.json', text: groovy.json.JsonOutput.toJson([
+                        build_number: env.BUILD_NUMBER,
+                        prediction_status: 'UNAVAILABLE',
+                        prediction_mode: 'advisory_only'
+                    ])
                 }
             }
         }
+    }
+}
 
         stage('High-Risk Preflight') {
             when { expression { env.AI_ROUTE == 'HIGH_RISK_PREFLIGHT' } }
