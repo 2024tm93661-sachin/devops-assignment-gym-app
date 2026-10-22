@@ -116,23 +116,32 @@ PY
         }
 
         stage('High-Risk Early Docker Preflight') {
-            when {
-                expression {
-                    params.PIPELINE_MODE == 'AI_OPTIMIZED' && env.AI_RISK == 'HIGH'
-                }
-            }
-            steps {
-                // Cheap independent checks before installing Python dependencies.
-                // A genuine Docker-daemon outage can fail here rather than after tests.
-                sh '''
-                    set -eu
-                    test -f Dockerfile
-                    test -f requirements.txt
-                    docker info >/dev/null
-                    echo 'High-risk preflight passed.'
-                '''
-            }
+    when {
+        expression {
+            return params.PIPELINE_MODE == 'AI_OPTIMIZED' &&
+                   (
+                       params.RISK_OVERRIDE == 'HIGH' ||
+                       (
+                           params.RISK_OVERRIDE == 'AUTO' &&
+                           env.AI_RISK == 'HIGH'
+                       )
+                   )
         }
+    }
+
+    steps {
+        echo "Running early Docker preflight"
+        echo "Pipeline mode: ${params.PIPELINE_MODE}"
+        echo "Risk override: ${params.RISK_OVERRIDE}"
+        echo "AI predicted risk: ${env.AI_RISK}"
+
+        sh '''
+            set -eu
+            docker info > /dev/null
+            echo "Docker preflight passed"
+        '''
+    }
+}
 
         stage('Install Dependencies') {
             steps {
